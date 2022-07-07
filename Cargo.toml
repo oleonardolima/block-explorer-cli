@@ -26,15 +26,12 @@ tokio-tungstenite = { version = "0.17.1", features = ["connect", "native-tls"]}
 url = { version = "2.0.0" }
 reqwest = { version = "0.11.11" }
 
-<<<<<<< HEAD
-=======
 [dev-dependencies]
 testcontainers = { version = "^0.14.0" }
-bitcoind = { version = "^0.26.1", features = [ "22_0" ] }
+bitcoind = { version = "^0.26.1", features = ["22_0"] }
 electrsd = { version = "^0.19.1", features = ["bitcoind_22_0", "electrs_0_9_1"] }
 serial_test = { version = "0.7.0" }
 
->>>>>>> origin/feature/add-unit-and-integration-tests-to-block-events
 [lib]
 name = "block_events"
 path = "src/lib.rs"
