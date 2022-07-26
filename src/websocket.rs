@@ -18,13 +18,20 @@ use super::api::{
 };
 
 use anyhow::{anyhow, Ok};
-use async_stream::stream;
-use futures_util::stream::Stream;
+use async_stream::try_stream;
+use core::result::Result::Ok as CoreOk;
+use futures_core::TryStream;
 use futures_util::{SinkExt, StreamExt};
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::{connect_async_tls_with_config, MaybeTlsStream, WebSocketStream};
+
+#[cfg(feature = "tls-secure")]
+static WEBSOCKET_PROTOCOL: &str = "wss";
+
+#[cfg(not(feature = "tls-secure"))]
+static WEBSOCKET_PROTOCOL: &str = "ws";
 
 /// Create a new WebSocket client for given base url and initial message
 ///
@@ -33,10 +40,9 @@ async fn websocket_client(
     base_url: &str,
     message: String,
 ) -> anyhow::Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
-    let url = url::Url::parse(format!("ws://{}/ws", base_url).as_str()).unwrap();
+    let url = url::Url::parse(format!("{}://{}/api/v1/ws", WEBSOCKET_PROTOCOL, base_url).as_str())?;
     log::info!("starting websocket handshake with url={}", url);
 
-    // TODO: (@leonardo.lima) It's needed to infer the tls security from network, or feature ?
     let (mut websocket_stream, websocket_response) =
         connect_async_tls_with_config(url, None, None).await?;
 
@@ -52,35 +58,30 @@ async fn websocket_client(
 }
 
 /// Connects to mempool.space WebSocket client and listen to new messages producing a stream of [`BlockExtended`] candidates
-pub async fn subscribe_to_blocks(
+pub async fn subscribe_to_block_headers(
     base_url: &str,
-) -> anyhow::Result<impl Stream<Item = BlockExtended>> {
+) -> anyhow::Result<impl TryStream<Item = anyhow::Result<BlockExtended>>> {
     let init_message = serde_json::to_string(&build_websocket_request_message(
         &MempoolSpaceWebSocketRequestData::Blocks,
-    ))
-    .unwrap();
+    ))?;
 
     let mut ws_stream = websocket_client(base_url, init_message).await?;
 
     // need to ping every so often to keep the websocket connection alive
     let mut pinger = tokio::time::interval(Duration::from_secs(60));
 
-    let stream = stream! {
+    let stream = try_stream! {
         loop {
             tokio::select! {
                 message = ws_stream.next() => {
                     if let Some(message) = message {
                         match message.unwrap() {
                             Message::Text(text) => {
-                                let parse_ws_msg = || -> anyhow::Result<()> {
-                                    let _: MempoolSpaceWebSocketMessage = serde_json::from_str(&text)?;
-                                    Ok(())
+                                let parsed_msg: MempoolSpaceWebSocketMessage = match serde_json::from_str(&text) {
+                                    Err(_) => continue,
+                                    CoreOk(parsed_msg) => parsed_msg,
                                 };
-                                if let Err(_) = parse_ws_msg() {
-                                    continue
-                                }
-                                let res_msg: MempoolSpaceWebSocketMessage = serde_json::from_str(&text).unwrap();
-                                yield res_msg.block;
+                                yield parsed_msg.block;
                             },
                             Message::Close(_) => {
                                 eprintln!("websocket closing gracefully");
@@ -96,7 +97,7 @@ pub async fn subscribe_to_blocks(
                 }
                 _ = pinger.tick() => {
                     log::info!("pinging to websocket to keep connection alive");
-                    ws_stream.send(Message::Ping(vec![])).await.unwrap() // TODO: (@leonardo.lima) Should this use a mempool expected ping message instead ?
+                    ws_stream.send(Message::Ping(vec![])).await.unwrap();
                 }
             }
         }

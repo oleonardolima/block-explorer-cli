@@ -70,9 +70,9 @@ pub enum MempoolSpaceWebSocketRequestData {
 
 /// Enum that implements the variants for `BlockEvent`
 #[derive(Debug, Clone, Copy)]
-pub enum BlockEvent {
+pub enum BlockEvent<T> {
     /// Used when connecting and extending the current active chain being streamed
-    Connected(BlockHeader),
+    Connected(T),
     /// Used when there is a fork or reorganization event that turns the block stale
     /// then it's disconnected from current active chain
     Disconnected((u32, BlockHash)),

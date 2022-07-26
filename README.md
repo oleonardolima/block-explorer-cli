@@ -59,7 +59,7 @@ async fn main() -> anyhow::Result<()> {
     let checkpoint = None;
 
     // async fetch the block-events stream through the lib
-    let block_events = block_events::subscribe_to_blocks(base_url, checkpoint).await?;
+    let block_events = block_events::subscribe_to_block_headers(base_url, checkpoint).await?;
 
     // consume and execute your code (current only matching and printing) in async manner for each new block-event
     pin_mut!(block_events);

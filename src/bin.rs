@@ -63,7 +63,9 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // async fetch the data stream through the lib
-    let block_events = block_events::subscribe_to_blocks(cli.base_url.as_str(), None).await?;
+    let checkpoint = None;
+    let block_events =
+        block_events::subscribe_to_block_headers(cli.base_url.as_str(), checkpoint).await?;
 
     // consume and execute the code (current matching and printing) in async manner for each new block-event
     pin_mut!(block_events);

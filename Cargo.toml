@@ -32,6 +32,12 @@ bitcoind = { version = "^0.26.1", features = ["22_0"] }
 electrsd = { version = "^0.19.1", features = ["bitcoind_22_0", "electrs_0_9_1"] }
 serial_test = { version = "0.7.0" }
 
+[features]
+default = ["mempool-backend"]
+tls-secure = []
+esplora-backend = []
+mempool-backend = []
+
 [lib]
 name = "block_events"
 path = "src/lib.rs"

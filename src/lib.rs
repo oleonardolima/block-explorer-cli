@@ -41,7 +41,7 @@
 //!     let checkpoint = None;
 //!
 //!     // async fetch the block-events stream through the lib
-//!     let block_events = block_events::subscribe_to_blocks(base_url, checkpoint).await?;
+//!     let block_events = block_events::subscribe_to_block_headers(base_url, checkpoint).await?;
 //!
 //!     // consume and execute your code (current only matching and printing) in async manner for each new block-event
 //!     pin_mut!(block_events);
@@ -66,6 +66,9 @@
 //! }
 //! ```
 
+#[cfg(all(feature = "esplora-backend", feature = "mempool-backend"))]
+compile_error!("features esplora-backend and mempool-backend are mutually exclusive and cannot be enabled together");
+
 pub mod api;
 pub mod http;
 pub mod websocket;
@@ -76,17 +79,17 @@ pub extern crate tokio;
 pub extern crate tokio_stream;
 pub extern crate tokio_tungstenite;
 
-use std::time::Duration;
 use std::{collections::HashMap, collections::VecDeque, pin::Pin};
 
 use api::{BlockEvent, BlockExtended};
+use futures_core::TryStream;
 use http::HttpClient;
 
 use anyhow::{anyhow, Ok};
-use async_stream::stream;
-use bitcoin::{BlockHash, BlockHeader};
+use async_stream::{stream, try_stream};
+use bitcoin::{Block, BlockHash, BlockHeader, Transaction};
+use core::result::Result::Ok as CoreOk;
 use futures_util::stream::Stream;
-use tokio::time::Instant;
 use tokio_stream::StreamExt;
 
 const DEFAULT_CONCURRENT_REQUESTS: u8 = 4;
@@ -173,37 +176,81 @@ impl BlockHeadersCache {
 }
 
 /// Subscribe to a real-time stream of [`BlockEvent`], for all new blocks or starting from an optional checkpoint
-pub async fn subscribe_to_blocks(
+pub async fn subscribe_to_block_headers(
     base_url: &str,
     checkpoint: Option<(u32, BlockHash)>,
-) -> anyhow::Result<Pin<Box<dyn Stream<Item = BlockEvent>>>> {
+) -> anyhow::Result<Pin<Box<dyn Stream<Item = BlockEvent<BlockHeader>>>>> {
     let http_client = http::HttpClient::new(base_url, DEFAULT_CONCURRENT_REQUESTS);
 
-    let current_tip = match checkpoint {
+    let tip_height = match checkpoint {
         Some((height, _)) => height - 1,
-        _ => http_client._get_height().await?,
+        _ => http_client._get_tip_height().await?,
     };
 
     let cache = BlockHeadersCache {
-        tip: http_client._get_block_height(current_tip).await?,
+        tip: http_client._get_block_hash(tip_height).await?,
         active_headers: HashMap::new(),
         stale_headers: HashMap::new(),
     };
 
     match checkpoint {
         Some(checkpoint) => {
-            let old_candidates = fetch_blocks(http_client.clone(), checkpoint).await?;
-            let new_candidates = websocket::subscribe_to_blocks(base_url).await?;
-            let candidates = Box::pin(old_candidates.chain(new_candidates));
-            let events = process_candidates(cache, candidates, http_client.clone()).await?;
-            Ok(Box::pin(events))
+            let prev_header_candidates = fetch_blocks(base_url, checkpoint).await?;
+            let new_header_candidates = websocket::subscribe_to_block_headers(base_url).await?;
+            let candidates = Box::pin(prev_header_candidates.chain(new_header_candidates));
+            Ok(Box::pin(
+                process_candidates(base_url, cache, candidates).await?,
+            ))
         }
-        _ => {
-            let candidates = Box::pin(websocket::subscribe_to_blocks(base_url).await?);
-            let events = process_candidates(cache, candidates, http_client.clone()).await?;
-            Ok(Box::pin(events))
+        None => {
+            let new_header_candidates =
+                Box::pin(websocket::subscribe_to_block_headers(base_url).await?);
+            Ok(Box::pin(
+                process_candidates(base_url, cache, new_header_candidates).await?,
+            ))
         }
     }
+}
+
+/// Subscribe to a real-time stream of [`BlockEvent`] of full rust-bitcoin blocks, for new mined blocks or
+/// starting from an optional checkpoint (height: u32, hash: BlockHash)
+pub async fn subscribe_to_blocks(
+    base_url: &str,
+    checkpoint: Option<(u32, BlockHash)>,
+) -> anyhow::Result<impl Stream<Item = anyhow::Result<BlockEvent<Block>>>> {
+    // build and create a http client
+    let http_client = http::HttpClient::new(base_url, DEFAULT_CONCURRENT_REQUESTS);
+
+    // subscribe to block_headers events
+    let mut header_events = subscribe_to_block_headers(base_url, checkpoint).await?;
+
+    // iterate through each event for block_headers
+    let stream = try_stream! {
+        while let Some(event) = header_events.next().await {
+            match event {
+                BlockEvent::Connected(header) => {
+                // fetch all transaction ids (Txids) for the block
+                let tx_ids = http_client._get_tx_ids(header.block_hash()).await?;
+
+                // fetch full transaction and build transaction list Vec<Transaction>
+                let mut txs: Vec<Transaction> = Vec::new();
+                for id in tx_ids {
+                    let tx = http_client._get_tx(id).await?;
+                    txs.push(Transaction::from(tx));
+                }
+
+                // yield connected event for full block
+                yield BlockEvent::Connected(Block {
+                    header: header,
+                    txdata: txs,
+                });
+            },
+                // otherwise yield error or the disconnected event
+                BlockEvent::Disconnected((height, hash)) => yield BlockEvent::Disconnected((height, hash)),
+            }
+        }
+    };
+    Ok(stream)
 }
 
 /// Process all candidates listened from source, it tries to apply the candidate to current active chain cached
@@ -215,39 +262,48 @@ pub async fn subscribe_to_blocks(
 ///  - apply forked branch, and produces [`BlockEvent::Disconnected`] for staled blocks and [`BlockEvent::Connected`]
 ///    for new branch
 async fn process_candidates(
+    base_url: &str,
     mut cache: BlockHeadersCache,
-    mut candidates: Pin<Box<dyn Stream<Item = BlockExtended>>>,
-    http_client: HttpClient,
-) -> anyhow::Result<impl Stream<Item = BlockEvent>> {
+    mut candidates: Pin<Box<dyn Stream<Item = anyhow::Result<BlockExtended>>>>,
+) -> anyhow::Result<impl Stream<Item = BlockEvent<BlockHeader>>> {
+    let http_client = HttpClient::new(base_url, DEFAULT_CONCURRENT_REQUESTS);
+
     let stream = stream! {
         while let Some(candidate) = candidates.next().await {
-            // TODO: (@leonardo.lima) It should check and validate for valid BlockHeaders
+            match candidate {
+                // TODO: (@leonardo.lima) We should handle and return an specific error for the client
+                Err(_) => {/* ignore */},
+                CoreOk(candidate) => {
+                    // TODO: (@leonardo.lima) It should check and validate for valid BlockHeaders
 
-            // validate if the [`BlockHeader`] candidate is a valid new tip
-            // yields a [`BlockEvent::Connected()`] variant and continue the iteration
-            if cache.validate_new_header(candidate) {
-                yield BlockEvent::Connected(BlockHeader::from(candidate.clone()));
-                continue
-            }
+                    // validate if the [`BlockHeader`] candidate is a valid new tip
+                    // yields a [`BlockEvent::Connected()`] variant and continue the iteration
+                    if cache.validate_new_header(candidate) {
+                        yield BlockEvent::Connected(BlockHeader::from(candidate.clone()));
+                        continue
+                    }
 
-            // find common ancestor for current active chain and the forked chain
-            // fetches forked chain candidates and store in cache
-            let (common_ancestor, fork_chain) = cache.find_or_fetch_common_ancestor(http_client.clone(), candidate).await.unwrap();
+                    // find common ancestor for current active chain and the forked chain
+                    // fetches forked chain candidates and store in cache
+                    let (common_ancestor, fork_chain) = cache.find_or_fetch_common_ancestor(http_client.clone(), candidate).await.unwrap();
 
-            // rollback current active chain, moving blocks to staled field
-            // yields BlockEvent::Disconnected((u32, BlockHash))
-            let mut disconnected: VecDeque<BlockExtended> = cache.rollback_active_chain(common_ancestor).await.unwrap();
-            while !disconnected.is_empty() {
-                let block: BlockExtended = disconnected.pop_back().unwrap();
-                yield BlockEvent::Disconnected((block.height, block.id));
-            }
+                    // rollback current active chain, moving blocks to staled field
+                    // yields BlockEvent::Disconnected((u32, BlockHash))
+                    let mut disconnected: VecDeque<BlockExtended> = cache.rollback_active_chain(common_ancestor).await.unwrap();
+                    while !disconnected.is_empty() {
+                        let block: BlockExtended = disconnected.pop_back().unwrap();
+                        yield BlockEvent::Disconnected((block.height, block.id));
+                    }
 
-            // iterate over forked chain candidates
-            // update [`Cache`] active_headers field with candidates
-            let (_, mut connected) = cache.apply_fork_chain(fork_chain).unwrap();
-            while !connected.is_empty() {
-                let block = connected.pop_back().unwrap();
-                yield BlockEvent::Connected(BlockHeader::from(block.clone()));
+                    // iterate over forked chain candidates
+                    // update [`Cache`] active_headers field with candidates
+                    let (_, mut connected) = cache.apply_fork_chain(fork_chain).unwrap();
+                    while !connected.is_empty() {
+                        let block = connected.pop_back().unwrap();
+                        yield BlockEvent::Connected(BlockHeader::from(block.clone()));
+                    }
+
+                },
             }
         }
     };
@@ -257,34 +313,32 @@ async fn process_candidates(
 /// Fetch all new starting from the checkpoint up to current active tip
 // FIXME: this fails when checkpoint is genesis block as it does not have a previousblockhash field
 pub async fn fetch_blocks(
-    http_client: HttpClient,
+    base_url: &str,
     checkpoint: (u32, BlockHash),
-) -> anyhow::Result<impl Stream<Item = BlockExtended>> {
-    let (ckpt_height, ckpt_hash) = checkpoint;
+) -> anyhow::Result<impl TryStream<Item = anyhow::Result<BlockExtended>>> {
+    let http_client = HttpClient::new(base_url, DEFAULT_CONCURRENT_REQUESTS);
 
-    if ckpt_hash != http_client._get_block_height(ckpt_height).await? {
+    // checks if the checkpoint height and hash matches for the current chain
+    let (ckpt_height, ckpt_hash) = checkpoint;
+    if ckpt_hash != http_client._get_block_hash(ckpt_height).await? {
         return Err(anyhow!(
             "The checkpoint passed is invalid, it should exist in the blockchain."
         ));
     }
 
-    let mut tip = http_client._get_height().await?;
-    let mut height = ckpt_height;
+    let tip_height = http_client._get_tip_height().await?;
+    let stream = try_stream! {
+        for height in ckpt_height..tip_height {
+            let hash = http_client._get_block_hash(height).await?;
+            let block = http_client._get_block(hash).await?;
 
-    let mut interval = Instant::now(); // it should try to update the tip every 5 minutes.
-    let stream = stream! {
-        while height <= tip {
-            let hash = http_client._get_block_height(height).await.unwrap();
-            let block = http_client._get_block(hash).await.unwrap();
-
-            height += 1;
-
-            if interval.elapsed() >= Duration::from_secs(300) {
-                interval = Instant::now();
-                tip = http_client._get_height().await.unwrap();
-            }
             yield block;
-        }
+        };
+
+        let height = http_client._get_tip_height().await?;
+        let hash = http_client._get_block_hash(height).await?;
+        let block = http_client._get_block(hash).await?;
+        yield block;
     };
     Ok(stream)
 }

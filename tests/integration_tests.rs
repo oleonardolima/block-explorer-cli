@@ -119,7 +119,6 @@ impl MempoolTestClient {
 
         let image = RunnableImage::from(image)
             .with_env_var(("MEMPOOL_BACKEND", "none"))
-            // .with_env_var(("MEMPOOL_NETWORK", "regtest"))
             .with_env_var(("DATABASE_HOST", docker_host_address().to_string()))
             .with_env_var(("CORE_RPC_HOST", docker_host_address().to_string()))
             .with_env_var(("CORE_RPC_PORT", bitcoind_port))
@@ -148,10 +147,6 @@ impl Default for MempoolTestClient {
     }
 }
 
-fn build_base_url(mapped_port: u16) -> String {
-    format!("{}:{}/api/v1", HOST_IP, mapped_port)
-}
-
 #[tokio::test]
 #[serial]
 async fn test_fetch_tip_height() {
@@ -168,13 +163,13 @@ async fn test_fetch_tip_height() {
 
     let rpc_client = &client.bitcoind.client;
     let http_client = HttpClient::new(
-        build_base_url(mempool.get_host_port_ipv4(8999)).as_str(),
+        format!("{}:{}", HOST_IP, mempool.get_host_port_ipv4(8999)).as_str(),
         DEFAULT_CONCURRENT_REQUESTS,
     );
 
     // should return the current tip height
     for i in 0..10 {
-        let tip = http_client._get_height().await.unwrap();
+        let tip = http_client._get_tip_height().await.unwrap();
         assert_eq!(i, tip);
 
         let _ = rpc_client
@@ -199,12 +194,12 @@ async fn test_fetch_block_hash_by_height() {
 
     let rpc_client = &client.bitcoind.client;
     let http_client = HttpClient::new(
-        build_base_url(mempool.get_host_port_ipv4(8999)).as_str(),
+        format!("{}:{}", HOST_IP, mempool.get_host_port_ipv4(8999)).as_str(),
         DEFAULT_CONCURRENT_REQUESTS,
     );
 
     // should return an error if there is no block created yet for given height
-    assert!(http_client._get_block_height(100).await.is_err());
+    assert!(http_client._get_block_hash(100).await.is_err());
 
     // should return block hash for existing block by height
     for i in 1..10 {
@@ -212,7 +207,7 @@ async fn test_fetch_block_hash_by_height() {
             .generate_to_address(1, &rpc_client.get_new_address(None, None).unwrap())
             .unwrap();
 
-        let res_hash = http_client._get_block_height(i).await.unwrap();
+        let res_hash = http_client._get_block_hash(i).await.unwrap();
         assert_eq!(gen_hash.first().unwrap(), &res_hash);
     }
 }
@@ -231,13 +226,12 @@ async fn test_fetch_blocks_for_invalid_checkpoint() {
 
     let mempool = docker.run(client.mempool_backend);
 
-    let http_client = HttpClient::new(
-        build_base_url(mempool.get_host_port_ipv4(8999)).as_str(),
-        DEFAULT_CONCURRENT_REQUESTS,
-    );
-
     let checkpoint = (0, BlockHash::default());
-    let blocks = block_events::fetch_blocks(http_client, checkpoint).await;
+    let blocks = block_events::fetch_blocks(
+        format!("{}:{}", HOST_IP, mempool.get_host_port_ipv4(8999)).as_str(),
+        checkpoint,
+    )
+    .await;
 
     // should produce an error for invalid checkpoint
     assert!(blocks.is_err());
@@ -263,32 +257,34 @@ async fn test_fetch_blocks_for_checkpoint() {
     let mempool = docker.run(client.mempool_backend);
 
     let rpc_client = &client.bitcoind.client;
-    let http_client = HttpClient::new(
-        build_base_url(mempool.get_host_port_ipv4(8999)).as_str(),
-        DEFAULT_CONCURRENT_REQUESTS,
-    );
 
     // generate new 20 blocks
     let mut gen_blocks = rpc_client
         .generate_to_address(20, &rpc_client.get_new_address(None, None).unwrap())
         .unwrap();
+    log::debug!("[{:#?}]", gen_blocks);
 
     let checkpoint = (10, *gen_blocks.get(9).unwrap());
-    let blocks = block_events::fetch_blocks(http_client, checkpoint)
-        .await
-        .unwrap();
+    let blocks = block_events::fetch_blocks(
+        format!("{}:{}", HOST_IP, mempool.get_host_port_ipv4(8999)).as_str(),
+        checkpoint,
+    )
+    .await
+    .unwrap();
 
     pin_mut!(blocks);
     // should return all 10 blocks from 10 to 20, as 10 being the checkpoint
     for gen_block in &mut gen_blocks[9..] {
-        let block = blocks.next().await.unwrap();
+        let block = blocks.next().await.unwrap().unwrap();
         assert_eq!(gen_block.deref(), &block.id);
     }
 }
 
 #[tokio::test]
+#[serial]
 async fn test_failure_for_invalid_websocket_url() {
-    let block_events = websocket::subscribe_to_blocks(build_base_url(8999).as_str()).await;
+    let block_events =
+        websocket::subscribe_to_block_headers(format!("{}:{}", HOST_IP, 8999).as_str()).await;
 
     // should return an Err.
     assert!(block_events.is_err());
@@ -315,8 +311,8 @@ async fn test_block_events_stream() {
     let mempool = docker.run(client.mempool_backend);
 
     // get block-events stream
-    let block_events = block_events::subscribe_to_blocks(
-        build_base_url(mempool.get_host_port_ipv4(mempool.get_host_port_ipv4(8999))).as_str(),
+    let block_events = block_events::subscribe_to_block_headers(
+        format!("{}:{}", HOST_IP, mempool.get_host_port_ipv4(8999)).as_str(),
         None,
     )
     .await
@@ -378,8 +374,8 @@ async fn test_block_events_stream_with_checkpoint() {
     let mempool = docker.run(client.mempool_backend);
 
     // get block-events stream, starting from the tip
-    let block_events = block_events::subscribe_to_blocks(
-        build_base_url(mempool.get_host_port_ipv4(mempool.get_host_port_ipv4(8999))).as_str(),
+    let block_events = block_events::subscribe_to_block_headers(
+        format!("{}:{}", HOST_IP, mempool.get_host_port_ipv4(8999)).as_str(),
         Some((3, checkpoint.block_hash())),
     )
     .await
@@ -419,8 +415,8 @@ async fn test_block_events_stream_with_reorg() {
     let mempool = docker.run(client.mempool_backend);
 
     // get block-events stream
-    let block_events = block_events::subscribe_to_blocks(
-        build_base_url(mempool.get_host_port_ipv4(mempool.get_host_port_ipv4(8999))).as_str(),
+    let block_events = block_events::subscribe_to_block_headers(
+        format!("{}:{}", HOST_IP, mempool.get_host_port_ipv4(8999)).as_str(),
         None,
     )
     .await
