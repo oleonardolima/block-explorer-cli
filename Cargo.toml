@@ -5,7 +5,7 @@ edition = "2021"
 authors = ["Leonardo Souza <leonardolimasza@gmail.com>", "LLFourn <lloyd.fourn@gmail.com>"]
 repository = "https://github.com/oleonardolima/block-events"
 description = "A real-time stream block events library, covering connected and disconnected blocks.\nThis a work in progress project for Summer of Bitcoin 2022."
-keywords = ["bitcoin", "blockchain", "blocks", "mempool-space", "stream", "events", "summer-of-bitcoin"]
+keywords = ["bitcoin", "blockchain", "blocks", "events", "mempool-space", "stream", "summer-of-bitcoin"]
 readme = "README.md"
 license = "MIT OR Apache-2.0"
 
@@ -15,28 +15,19 @@ async-stream = { version = "0.3.3"}
 bitcoin = { version = "0.28", features = ["use-serde", "base64"] }
 clap = { version = "3.0", features = ["derive"]}
 env_logger = { version = "0.9.0" }
-futures-core = { version = "0.3" }
-futures-util = { version = "0.3" }
+futures = { version = "0.3" }
 log = { version = "0.4" }
+reqwest = { version = "0.11.11" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0" }
-tokio = { version = "1.19.2", features = ["io-util", "io-std", "macros", "net", "rt-multi-thread", "time"] }
-tokio-stream = { version = "0.1.9" }
+tokio = { version = "1.19.2", features = ["macros", "rt-multi-thread"] }
 tokio-tungstenite = { version = "0.17.1", features = ["connect", "native-tls"]}
 url = { version = "2.0.0" }
-reqwest = { version = "0.11.11" }
 
 [dev-dependencies]
 testcontainers = { version = "^0.14.0" }
 bitcoind = { version = "^0.26.1", features = ["22_0"] }
-electrsd = { version = "^0.19.1", features = ["bitcoind_22_0", "electrs_0_9_1"] }
 serial_test = { version = "0.7.0" }
-
-[features]
-default = ["mempool-backend"]
-tls-secure = []
-esplora-backend = []
-mempool-backend = []
 
 [lib]
 name = "block_events"

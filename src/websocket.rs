@@ -8,39 +8,31 @@
 // licenses.
 
 //! WebSocket module for mempool.space
-//! It has functions to connect and create a new WebSocket client, and also subscribe for only new block events
-
-use crate::api::BlockExtended;
+//! It has functions to connect and create a new WebSocket client, and also subscribe for new blocks (BlockHeaders)
 
 use super::api::{
     MempoolSpaceWebSocketMessage, MempoolSpaceWebSocketRequestData,
     MempoolSpaceWebSocketRequestMessage,
 };
 
-use anyhow::{anyhow, Ok};
+use anyhow::{anyhow, Ok as AnyhowOk};
 use async_stream::try_stream;
-use core::result::Result::Ok as CoreOk;
-use futures_core::TryStream;
-use futures_util::{SinkExt, StreamExt};
+use bitcoin::BlockHeader;
+use core::result::Result::Ok;
+use futures::{SinkExt, StreamExt, TryStream};
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::{connect_async_tls_with_config, MaybeTlsStream, WebSocketStream};
 
-#[cfg(feature = "tls-secure")]
-static WEBSOCKET_PROTOCOL: &str = "wss";
-
-#[cfg(not(feature = "tls-secure"))]
-static WEBSOCKET_PROTOCOL: &str = "ws";
-
 /// Create a new WebSocket client for given base url and initial message
 ///
-/// It uses `tokio_tungestenite` crate and produces `WebSocketStream` to be handled and treated by caller
+/// It uses `tokio_tungestenite` crate and produces [`WebSocketStream`] to be handled and treated by caller
 async fn websocket_client(
     base_url: &str,
     message: String,
 ) -> anyhow::Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
-    let url = url::Url::parse(format!("{}://{}/api/v1/ws", WEBSOCKET_PROTOCOL, base_url).as_str())?;
+    let url = url::Url::parse(format!("{}/api/v1/ws", base_url).as_str())?;
     log::info!("starting websocket handshake with url={}", url);
 
     let (mut websocket_stream, websocket_response) =
@@ -54,13 +46,13 @@ async fn websocket_client(
         return Err(anyhow!("failed to publish first message to websocket"));
     };
     log::info!("published message: {:#?}, successfully!", &message);
-    Ok(websocket_stream)
+    AnyhowOk(websocket_stream)
 }
 
-/// Connects to mempool.space WebSocket client and listen to new messages producing a stream of [`BlockExtended`] candidates
-pub async fn subscribe_to_block_headers(
+/// Connects to mempool.space WebSocket client and listen to new messages producing a stream of [`BlockHeader`] candidates
+pub async fn listen_new_block_headers(
     base_url: &str,
-) -> anyhow::Result<impl TryStream<Item = anyhow::Result<BlockExtended>>> {
+) -> anyhow::Result<impl TryStream<Item = anyhow::Result<BlockHeader>>> {
     let init_message = serde_json::to_string(&build_websocket_request_message(
         &MempoolSpaceWebSocketRequestData::Blocks,
     ))?;
@@ -75,34 +67,41 @@ pub async fn subscribe_to_block_headers(
             tokio::select! {
                 message = ws_stream.next() => {
                     if let Some(message) = message {
-                        match message.unwrap() {
-                            Message::Text(text) => {
-                                let parsed_msg: MempoolSpaceWebSocketMessage = match serde_json::from_str(&text) {
-                                    Err(_) => continue,
-                                    CoreOk(parsed_msg) => parsed_msg,
-                                };
-                                yield parsed_msg.block;
+                        match message {
+                            Ok(message) => match message {
+                                Message::Text(text) => {
+                                    let parsed: MempoolSpaceWebSocketMessage = match serde_json::from_str(&text) {
+                                        Err(_) => continue,
+                                        Ok(parsed) => parsed,
+                                    };
+                                    yield BlockHeader::from(parsed.block);
+                                },
+                                Message::Close(_) => {
+                                    eprintln!("websocket closing gracefully");
+                                    break;
+                                },
+                                Message::Binary(_) => {
+                                    eprintln!("unexpected binary message");
+                                    break;
+                                },
+                                _ => {/* ignore */}
                             },
-                            Message::Close(_) => {
-                                eprintln!("websocket closing gracefully");
-                                break;
-                            },
-                            Message::Binary(_) => {
-                                eprintln!("unexpected binary message");
-                                break;
-                            },
-                            _ => { /*ignore*/ }
+                            Err(_error) => { /* ignore */},
                         }
                     }
                 }
                 _ = pinger.tick() => {
                     log::info!("pinging to websocket to keep connection alive");
-                    ws_stream.send(Message::Ping(vec![])).await.unwrap();
+                    if (ws_stream.send(Message::Ping(vec![])).await).is_err() {
+                        log::error!("failed to send ping message to websocket");
+                        continue
+                    }
                 }
             }
         }
     };
-    Ok(stream)
+
+    AnyhowOk(stream)
 }
 
 fn build_websocket_request_message(

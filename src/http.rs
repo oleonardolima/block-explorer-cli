@@ -13,84 +13,92 @@
 #![allow(unused_imports)]
 use std::ops::Deref;
 
-use bitcoin::{consensus::deserialize, hashes::hex::FromHex, Block, BlockHash, Transaction, Txid};
+use bitcoin::{
+    consensus::deserialize, hashes::hex::FromHex, Block, BlockHash, BlockHeader, Transaction, Txid,
+};
 use reqwest::Client;
 
 use crate::api::BlockExtended;
 
-#[cfg(feature = "tls-secure")]
-static HTTP_PROTOCOL: &str = "https";
-
-#[cfg(not(feature = "tls-secure"))]
-static HTTP_PROTOCOL: &str = "http";
-
-#[cfg(feature = "esplora-backend")]
-static API_PREFIX: &str = "api";
-
-#[cfg(feature = "mempool-backend")]
-static API_PREFIX: &str = "api/v1";
-
 /// Generic HttpClient using `reqwest`
-/// It has been based on the Esplora client from BDK
+///
+/// This implementation and approach is based on the BDK's esplora client
+///
+/// `<https://github.com/bitcoindevkit/bdk/blob/master/src/blockchain/esplora/reqwest.rs>`
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct HttpClient {
-    url: String,
+    /// The base url for building our http rest calls
+    /// It's expected to have the protocol, domain and initial api path (e.g: `<http://mempool.space/api/v1>`)
+    base_url: String,
+    /// A `reqwest` client with default or selected config
     client: Client,
+    /// The number of concurrency requests the client is allowed to make
     concurrency: u8,
 }
 
 impl HttpClient {
     /// Creates a new HttpClient, for given base url and concurrency
-    pub fn new(base_url: &str, concurrency: u8) -> Self {
-        let url =
-            url::Url::parse(format!("{}://{}/{}", HTTP_PROTOCOL, base_url, API_PREFIX).as_str())
-                .unwrap();
+    pub fn new(base_url: &str) -> Self {
         HttpClient {
-            url: url.to_string(),
             client: Client::new(),
-            concurrency,
+            base_url: base_url.to_string(),
+            concurrency: crate::DEFAULT_CONCURRENT_REQUESTS,
         }
     }
 
-    /// Get current blockchain block height (the current tip height)
-    pub async fn _get_tip_height(&self) -> anyhow::Result<u32> {
+    /// Get current blockchain height [`u32`], the current tip height
+    pub async fn get_tip_height(&self) -> anyhow::Result<u32> {
         let res = self
             .client
-            .get(&format!("{}/blocks/tip/height", self.url))
+            .get(&format!("{}/blocks/tip/height", self.base_url))
             .send()
             .await?;
 
         Ok(res.error_for_status()?.text().await?.parse()?)
     }
 
-    /// Get [`BlockHash`] from mempool.space, for current tip
-    pub async fn _get_tip_hash(&self) -> anyhow::Result<BlockHash> {
+    /// Get current blockchain hash [`BlockHash`], the current tip hash
+    pub async fn get_tip_hash(&self) -> anyhow::Result<BlockHash> {
         let res = self
             .client
-            .get(&format!("{}/blocks/tip/hash", self.url))
+            .get(&format!("{}/blocks/tip/hash", self.base_url))
             .send()
             .await?;
 
         Ok(res.error_for_status()?.text().await?.parse()?)
     }
 
-    /// Get [`BlockHash`] from mempool.space, for given block height
-    pub async fn _get_block_hash(&self, height: u32) -> anyhow::Result<BlockHash> {
+    /// Get the [`BlockHash`] for given block height
+    pub async fn get_block_hash(&self, height: u32) -> anyhow::Result<BlockHash> {
         let res = self
             .client
-            .get(&format!("{}/block-height/{}", self.url, height))
+            .get(&format!("{}/block-height/{}", self.base_url, height))
             .send()
             .await?;
 
         Ok(res.error_for_status()?.text().await?.parse()?)
     }
 
-    /// Get [`BlockExtended`] from mempool.space, by [`BlockHash`]
-    pub async fn _get_block(&self, block_hash: BlockHash) -> anyhow::Result<BlockExtended> {
+    /// Get the [`BlockHeader`] for given [`BlockHash`]
+    pub async fn get_block_header(&self, hash: BlockHash) -> anyhow::Result<BlockHeader> {
         let res = self
             .client
-            .get(&format!("{}/block/{}", self.url, block_hash))
+            .get(&format!("{}/block/{}/header", self.base_url, hash))
+            .send()
+            .await?;
+
+        let raw_header = Vec::<u8>::from_hex(res.error_for_status()?.text().await?.as_str())?;
+        let header: BlockHeader = deserialize(&raw_header)?;
+
+        Ok(header)
+    }
+
+    /// Get full block in [`BlockExtended`] format, for given [`BlockHash`]
+    pub async fn get_block(&self, block_hash: BlockHash) -> anyhow::Result<BlockExtended> {
+        let res = self
+            .client
+            .get(&format!("{}/block/{}", self.base_url, block_hash))
             .send()
             .await?;
 
@@ -99,12 +107,14 @@ impl HttpClient {
         )?)
     }
 
-    /// FIXME: (@leonardo.lima) this only works when using the blockstream.info (esplora) client
-    #[cfg(feature = "esplora-backend")]
-    pub async fn _get_block_raw(&self, block_hash: BlockHash) -> anyhow::Result<Block> {
+    /// This only works when using the blockstream.info (esplora) client, it does not work with mempool.space client
+    ///
+    /// NOTE: It will be used instead of multiple calls for building blocks as this commit is added in a new mempool.space
+    /// release: `<https://github.com/mempool/mempool/commit/b2e657374350045ed2fad282a73b7b0c7975376f>`
+    pub async fn get_block_raw(&self, block_hash: BlockHash) -> anyhow::Result<Block> {
         let res = self
             .client
-            .get(&format!("{}/block/{}/raw", self.url, block_hash))
+            .get(&format!("{}/block/{}/raw", self.base_url, block_hash))
             .send()
             .await?;
 
@@ -113,28 +123,29 @@ impl HttpClient {
         Ok(block)
     }
 
-    pub async fn _get_tx(&self, tx_id: Txid) -> anyhow::Result<Transaction> {
+    /// Get all transactions ids [`Vec<Txid>`] for given [`BlockHash`]
+    pub async fn get_tx_ids(&self, block_hash: BlockHash) -> anyhow::Result<Vec<Txid>> {
         let res = self
             .client
-            .get(&format!("{}/tx/{}/hex", self.url, tx_id))
-            .send()
-            .await?;
-
-        let tx: Transaction = deserialize(&Vec::<u8>::from_hex(
-            res.error_for_status()?.text().await?.as_str(),
-        )?)?;
-
-        Ok(tx)
-    }
-
-    pub async fn _get_tx_ids(&self, block_hash: BlockHash) -> anyhow::Result<Vec<Txid>> {
-        let res = self
-            .client
-            .get(format!("{}/block/{}/txids", self.url, block_hash))
+            .get(format!("{}/block/{}/txids", self.base_url, block_hash))
             .send()
             .await?;
 
         let tx_ids: Vec<Txid> = serde_json::from_str(res.text().await?.as_str())?;
         Ok(tx_ids)
+    }
+
+    /// Get the [`Transaction`] for given transaction hash/id [`Txid`]
+    pub async fn get_tx(&self, tx_id: Txid) -> anyhow::Result<Transaction> {
+        let res = self
+            .client
+            .get(&format!("{}/tx/{}/hex", self.base_url, tx_id))
+            .send()
+            .await?;
+
+        let raw_tx = Vec::<u8>::from_hex(res.error_for_status()?.text().await?.as_str())?;
+        let tx: Transaction = deserialize(&raw_tx)?;
+
+        Ok(tx)
     }
 }

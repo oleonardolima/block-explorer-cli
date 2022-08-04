@@ -1,12 +1,10 @@
 use bitcoin::BlockHash;
 use bitcoind::{bitcoincore_rpc::RpcApi, BitcoinD};
 use block_events::{api::BlockEvent, http::HttpClient, websocket};
-use futures_util::{pin_mut, StreamExt};
+use futures::{pin_mut, StreamExt};
 use serial_test::serial;
 use std::{collections::VecDeque, ops::Deref, time::Duration};
 use testcontainers::{clients, images, images::generic::GenericImage, RunnableImage};
-
-const DEFAULT_CONCURRENT_REQUESTS: u8 = 4;
 
 const HOST_IP: &str = "127.0.0.1";
 
@@ -58,7 +56,20 @@ impl MempoolTestClient {
 
         let bitcoind = BitcoinD::with_conf(&bitcoind_exe, &conf).unwrap();
 
-        log::debug!("successfully launched [bitcoind_exe {:?}]", bitcoind_exe);
+        // get a new address from node wallet
+        let node_address = bitcoind.client.get_new_address(None, None).unwrap();
+
+        // generate first 101 blocks
+        bitcoind
+            .client
+            .generate_to_address(101, &node_address)
+            .unwrap();
+
+        log::debug!(
+            "successfully launched bitcoind and generated initial coins [bitcoind_exe {:?}]",
+            bitcoind_exe
+        );
+
         bitcoind
     }
 
@@ -162,14 +173,12 @@ async fn test_fetch_tip_height() {
     let mempool = docker.run(client.mempool_backend);
 
     let rpc_client = &client.bitcoind.client;
-    let http_client = HttpClient::new(
-        format!("{}:{}", HOST_IP, mempool.get_host_port_ipv4(8999)).as_str(),
-        DEFAULT_CONCURRENT_REQUESTS,
-    );
+    let http_client =
+        HttpClient::new(format!("{}:{}", HOST_IP, mempool.get_host_port_ipv4(8999)).as_str());
 
     // should return the current tip height
     for i in 0..10 {
-        let tip = http_client._get_tip_height().await.unwrap();
+        let tip = http_client.get_tip_height().await.unwrap();
         assert_eq!(i, tip);
 
         let _ = rpc_client
@@ -194,12 +203,16 @@ async fn test_fetch_block_hash_by_height() {
 
     let rpc_client = &client.bitcoind.client;
     let http_client = HttpClient::new(
-        format!("{}:{}", HOST_IP, mempool.get_host_port_ipv4(8999)).as_str(),
-        DEFAULT_CONCURRENT_REQUESTS,
+        format!(
+            "http://{}:{}/api/v1",
+            HOST_IP,
+            mempool.get_host_port_ipv4(8999)
+        )
+        .as_str(),
     );
 
     // should return an error if there is no block created yet for given height
-    assert!(http_client._get_block_hash(100).await.is_err());
+    assert!(http_client.get_block_hash(100).await.is_err());
 
     // should return block hash for existing block by height
     for i in 1..10 {
@@ -207,7 +220,7 @@ async fn test_fetch_block_hash_by_height() {
             .generate_to_address(1, &rpc_client.get_new_address(None, None).unwrap())
             .unwrap();
 
-        let res_hash = http_client._get_block_hash(i).await.unwrap();
+        let res_hash = http_client.get_block_hash(i).await.unwrap();
         assert_eq!(gen_hash.first().unwrap(), &res_hash);
     }
 }
@@ -227,7 +240,7 @@ async fn test_fetch_blocks_for_invalid_checkpoint() {
     let mempool = docker.run(client.mempool_backend);
 
     let checkpoint = (0, BlockHash::default());
-    let blocks = block_events::fetch_blocks(
+    let blocks = block_events::fetch_block_headers(
         format!("{}:{}", HOST_IP, mempool.get_host_port_ipv4(8999)).as_str(),
         checkpoint,
     )
@@ -265,7 +278,7 @@ async fn test_fetch_blocks_for_checkpoint() {
     log::debug!("[{:#?}]", gen_blocks);
 
     let checkpoint = (10, *gen_blocks.get(9).unwrap());
-    let blocks = block_events::fetch_blocks(
+    let blocks = block_events::fetch_block_headers(
         format!("{}:{}", HOST_IP, mempool.get_host_port_ipv4(8999)).as_str(),
         checkpoint,
     )
@@ -276,7 +289,7 @@ async fn test_fetch_blocks_for_checkpoint() {
     // should return all 10 blocks from 10 to 20, as 10 being the checkpoint
     for gen_block in &mut gen_blocks[9..] {
         let block = blocks.next().await.unwrap().unwrap();
-        assert_eq!(gen_block.deref(), &block.id);
+        assert_eq!(gen_block.deref(), &block.block_hash());
     }
 }
 
@@ -284,7 +297,7 @@ async fn test_fetch_blocks_for_checkpoint() {
 #[serial]
 async fn test_failure_for_invalid_websocket_url() {
     let block_events =
-        websocket::subscribe_to_block_headers(format!("{}:{}", HOST_IP, 8999).as_str()).await;
+        websocket::listen_new_block_headers(format!("{}:{}", HOST_IP, 8999).as_str()).await;
 
     // should return an Err.
     assert!(block_events.is_err());
@@ -310,9 +323,24 @@ async fn test_block_events_stream() {
     std::thread::sleep(delay); // there is some delay between running the docker and the port being really available
     let mempool = docker.run(client.mempool_backend);
 
+    log::debug!(
+        "{:?}",
+        &client.bitcoind.client.get_blockchain_info().unwrap(),
+    );
+
+    log::debug!("{:?}", &client.bitcoind.client.get_chain_tips(),);
+
+    let http_base_url = format!(
+        "http://{}:{}/api/v1",
+        HOST_IP,
+        mempool.get_host_port_ipv4(8999)
+    );
+    let ws_base_url = format!("ws://{}:{}", HOST_IP, mempool.get_host_port_ipv4(8999));
+
     // get block-events stream
     let block_events = block_events::subscribe_to_block_headers(
-        format!("{}:{}", HOST_IP, mempool.get_host_port_ipv4(8999)).as_str(),
+        http_base_url.as_str(),
+        ws_base_url.as_str(),
         None,
     )
     .await
@@ -332,7 +360,7 @@ async fn test_block_events_stream() {
     pin_mut!(block_events);
     while !generated_blocks.is_empty() {
         let block_hash = generated_blocks.pop_front().unwrap();
-        let block_event = block_events.next().await.unwrap();
+        let block_event = block_events.next().await.unwrap().unwrap();
 
         // should produce a BlockEvent::Connected result for each block event
         assert!(matches!(block_event, BlockEvent::Connected { .. }));
@@ -373,9 +401,17 @@ async fn test_block_events_stream_with_checkpoint() {
     std::thread::sleep(delay); // there is some delay between running the docker and the port being really available
     let mempool = docker.run(client.mempool_backend);
 
+    let http_base_url = format!(
+        "http://{}:{}/api/v1",
+        HOST_IP,
+        mempool.get_host_port_ipv4(8999)
+    );
+    let ws_base_url = format!("ws://{}:{}", HOST_IP, mempool.get_host_port_ipv4(8999));
+
     // get block-events stream, starting from the tip
     let block_events = block_events::subscribe_to_block_headers(
-        format!("{}:{}", HOST_IP, mempool.get_host_port_ipv4(8999)).as_str(),
+        http_base_url.as_str(),
+        ws_base_url.as_str(),
         Some((3, checkpoint.block_hash())),
     )
     .await
@@ -385,7 +421,7 @@ async fn test_block_events_stream_with_checkpoint() {
     pin_mut!(block_events);
     while !first_blocks.is_empty() {
         let block_hash = first_blocks.pop_front().unwrap();
-        let block_event = block_events.next().await.unwrap();
+        let block_event = block_events.next().await.unwrap().unwrap();
 
         // should produce a BlockEvent::Connected result for each block event
         assert!(matches!(block_event, BlockEvent::Connected { .. }));
@@ -414,13 +450,18 @@ async fn test_block_events_stream_with_reorg() {
     std::thread::sleep(delay); // there is some delay between running the docker and the port being really available
     let mempool = docker.run(client.mempool_backend);
 
+    let http_base_url = format!(
+        "http://{}:{}/api/v1",
+        HOST_IP,
+        mempool.get_host_port_ipv4(8999)
+    );
+    let ws_base_url = format!("ws://{}:{}", HOST_IP, mempool.get_host_port_ipv4(8999));
+
     // get block-events stream
-    let block_events = block_events::subscribe_to_block_headers(
-        format!("{}:{}", HOST_IP, mempool.get_host_port_ipv4(8999)).as_str(),
-        None,
-    )
-    .await
-    .unwrap();
+    let block_events =
+        block_events::subscribe_to_block_headers(http_base_url.deref(), ws_base_url.deref(), None)
+            .await
+            .unwrap();
 
     // initiate bitcoind client
     let rpc_client = &client.bitcoind.client;
@@ -437,7 +478,7 @@ async fn test_block_events_stream_with_reorg() {
     pin_mut!(block_events);
     while !new_blocks.is_empty() {
         let block_hash = new_blocks.pop_front().unwrap();
-        let block_event = block_events.next().await.unwrap();
+        let block_event = block_events.next().await.unwrap().unwrap();
 
         // should produce a BlockEvent::Connected result for each block event
         assert!(matches!(block_event, BlockEvent::Connected { .. }));
@@ -467,7 +508,7 @@ async fn test_block_events_stream_with_reorg() {
     // should disconnect invalidated blocks
     while !invalidated_blocks.is_empty() {
         let invalidated = invalidated_blocks.pop_back().unwrap();
-        let block_event = block_events.next().await.unwrap();
+        let block_event = block_events.next().await.unwrap().unwrap();
 
         // should produce a BlockEvent::Connected result for each block event
         assert!(matches!(block_event, BlockEvent::Disconnected(..)));
@@ -483,7 +524,7 @@ async fn test_block_events_stream_with_reorg() {
     // should connect the new created blocks
     while !new_blocks.is_empty() {
         let new_block = new_blocks.pop_front().unwrap();
-        let block_event = block_events.next().await.unwrap();
+        let block_event = block_events.next().await.unwrap().unwrap();
 
         // should produce a BlockEvent::Connected result for each block event
         assert!(matches!(block_event, BlockEvent::Connected { .. }));

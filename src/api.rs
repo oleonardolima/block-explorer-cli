@@ -10,7 +10,7 @@
 //! All structs from mempool.space API
 //! Also contains the main [`BlockEvent`]
 
-use bitcoin::{Address, BlockHash, BlockHeader, TxMerkleNode};
+use bitcoin::{Address, Block, BlockHash, BlockHeader, TxMerkleNode};
 
 /// A structure that implements the equivalent `BlockExtended` type from mempool.space,
 /// which is expected and parsed as response
@@ -19,27 +19,44 @@ pub struct BlockExtended {
     pub id: BlockHash,
     pub height: u32,
     pub version: i32,
-    // none for genesis block
     #[serde(alias = "previousblockhash")]
-    pub prev_blockhash: BlockHash,
+    pub prev_blockhash: Option<BlockHash>, // None for genesis block
     pub merkle_root: TxMerkleNode,
     #[serde(alias = "timestamp")]
     pub time: u32,
     pub bits: u32,
     pub nonce: u32,
-    // add new fields if needed
 }
 
-// FIXME: (@leonardo.lima) Should this use serde_json or some other approach instead ?
 impl From<BlockExtended> for BlockHeader {
-    fn from(extended: BlockExtended) -> BlockHeader {
+    fn from(extended: BlockExtended) -> Self {
         BlockHeader {
-            version: (extended.version),
-            prev_blockhash: (extended.prev_blockhash),
-            merkle_root: (extended.merkle_root),
-            time: (extended.time),
-            bits: (extended.bits),
-            nonce: (extended.nonce),
+            version: extended.version,
+            prev_blockhash: extended
+                .prev_blockhash
+                .expect("Given `api::BlockExtended` does not have prev_blockhash field"),
+            merkle_root: extended.merkle_root,
+            time: extended.time,
+            bits: extended.bits,
+            nonce: extended.nonce,
+        }
+    }
+}
+
+impl From<Block> for BlockExtended {
+    fn from(block: Block) -> Self {
+        BlockExtended {
+            id: block.block_hash(),
+            height: block
+                .bip34_block_height()
+                .expect("Given `bitcoin::Block` does not have height encoded as bip34")
+                as u32,
+            version: block.header.version,
+            prev_blockhash: Some(block.header.prev_blockhash),
+            merkle_root: block.header.merkle_root,
+            time: block.header.time,
+            bits: block.header.bits,
+            nonce: block.header.nonce,
         }
     }
 }
@@ -48,6 +65,9 @@ impl From<BlockExtended> for BlockHeader {
 #[derive(serde::Deserialize, Debug)]
 pub struct MempoolSpaceWebSocketMessage {
     pub block: BlockExtended,
+    // pub mempool_info: MempoolInfo,
+    // pub da: DifficultyAdjustment,
+    // pub fees: RecommendedFee,
 }
 
 /// Structure that implements the standard fields for mempool.space WebSocket client message

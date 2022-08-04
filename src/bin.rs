@@ -1,6 +1,6 @@
 use anyhow::Ok;
 use clap::{ArgGroup, Parser, Subcommand};
-use futures_util::{pin_mut, StreamExt};
+use futures::{pin_mut, StreamExt};
 use serde::{Deserialize, Serialize};
 
 #[derive(Parser)]
@@ -15,8 +15,11 @@ struct Cli {
     #[clap(subcommand)]
     command: Commands,
 
-    #[clap(short, long, default_value = "mempool.space/testnet/api/v1")]
-    base_url: String,
+    #[clap(short, long, default_value = "https://mempool.space/testnet/api")]
+    http_base_url: String,
+
+    #[clap(short, long, default_value = "wss://mempool.space/testnet/")]
+    ws_base_url: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -64,8 +67,12 @@ async fn main() -> anyhow::Result<()> {
 
     // async fetch the data stream through the lib
     let checkpoint = None;
-    let block_events =
-        block_events::subscribe_to_block_headers(cli.base_url.as_str(), checkpoint).await?;
+    let block_events = block_events::subscribe_to_block_headers(
+        cli.http_base_url.as_str(),
+        cli.ws_base_url.as_str(),
+        checkpoint,
+    )
+    .await?;
 
     // consume and execute the code (current matching and printing) in async manner for each new block-event
     pin_mut!(block_events);
