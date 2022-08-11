@@ -13,7 +13,7 @@ const MARIADB_TAG: &str = "10.5.8";
 const MARIADB_READY_CONDITION: &str = "mysqld: ready for connections.";
 
 const MEMPOOL_BACKEND_NAME: &str = "mempool/backend";
-const MEMPOOL_BACKEND_TAG: &str = "v2.4.0";
+const MEMPOOL_BACKEND_TAG: &str = "v2.4.1";
 const MEMPOOL_BACKEND_READY_CONDITION: &str = "Mempool Server is running on port 8999";
 
 // TODO: (@leonardo.lima) This should be derived instead, should we add it to bitcoind ?
@@ -55,15 +55,6 @@ impl MempoolTestClient {
         conf.args.push("-server");
 
         let bitcoind = BitcoinD::with_conf(&bitcoind_exe, &conf).unwrap();
-
-        // get a new address from node wallet
-        let node_address = bitcoind.client.get_new_address(None, None).unwrap();
-
-        // generate first 101 blocks
-        bitcoind
-            .client
-            .generate_to_address(101, &node_address)
-            .unwrap();
 
         log::debug!(
             "successfully launched bitcoind and generated initial coins [bitcoind_exe {:?}]",
@@ -151,9 +142,9 @@ impl Default for MempoolTestClient {
         let mempool = Self::start_backend(None, None, &bitcoind);
 
         MempoolTestClient {
-            bitcoind: (bitcoind),
-            mariadb_database: (mariadb),
-            mempool_backend: (mempool),
+            bitcoind: bitcoind,
+            mariadb_database: mariadb,
+            mempool_backend: mempool,
         }
     }
 }
@@ -162,28 +153,36 @@ impl Default for MempoolTestClient {
 #[serial]
 async fn test_fetch_tip_height() {
     let _ = env_logger::try_init();
-    let delay = Duration::from_millis(5000);
+
+    let MempoolTestClient {
+        bitcoind,
+        mariadb_database,
+        mempool_backend,
+    } = MempoolTestClient::default();
 
     let docker = clients::Cli::docker();
-    let client = MempoolTestClient::default();
+    let _mariadb = docker.run(mariadb_database);
 
-    let _mariadb = docker.run(client.mariadb_database);
+    // there is some small delay between running the docker for mariadb database and the port being really available
+    std::thread::sleep(Duration::from_millis(5000));
+    let mempool = docker.run(mempool_backend);
 
-    std::thread::sleep(delay); // there is some delay between running the docker and the port being really available
-    let mempool = docker.run(client.mempool_backend);
+    let base_url = format!(
+        "http://{}:{}/api/v1",
+        HOST_IP,
+        mempool.get_host_port_ipv4(8999)
+    );
 
-    let rpc_client = &client.bitcoind.client;
-    let http_client =
-        HttpClient::new(format!("{}:{}", HOST_IP, mempool.get_host_port_ipv4(8999)).as_str());
+    let http_client = HttpClient::new(&base_url);
 
     // should return the current tip height
-    for i in 0..10 {
+    for i in 0..5 {
         let tip = http_client.get_tip_height().await.unwrap();
         assert_eq!(i, tip);
 
-        let _ = rpc_client
-            .generate_to_address(1, &rpc_client.get_new_address(None, None).unwrap())
-            .unwrap();
+        // generate new block
+        let address = bitcoind.client.get_new_address(None, None).unwrap();
+        let _ = bitcoind.client.generate_to_address(1, &address).unwrap();
     }
 }
 
@@ -202,14 +201,12 @@ async fn test_fetch_block_hash_by_height() {
     let mempool = docker.run(client.mempool_backend);
 
     let rpc_client = &client.bitcoind.client;
-    let http_client = HttpClient::new(
-        format!(
-            "http://{}:{}/api/v1",
-            HOST_IP,
-            mempool.get_host_port_ipv4(8999)
-        )
-        .as_str(),
+    let base_url = format!(
+        "http://{}:{}/api/v1",
+        HOST_IP,
+        mempool.get_host_port_ipv4(8999)
     );
+    let http_client = HttpClient::new(&base_url);
 
     // should return an error if there is no block created yet for given height
     assert!(http_client.get_block_hash(100).await.is_err());
@@ -239,12 +236,13 @@ async fn test_fetch_blocks_for_invalid_checkpoint() {
 
     let mempool = docker.run(client.mempool_backend);
 
+    let base_url = format!(
+        "http://{}:{}/api/v1",
+        HOST_IP,
+        mempool.get_host_port_ipv4(8999)
+    );
     let checkpoint = (0, BlockHash::default());
-    let blocks = block_events::fetch_block_headers(
-        format!("{}:{}", HOST_IP, mempool.get_host_port_ipv4(8999)).as_str(),
-        checkpoint,
-    )
-    .await;
+    let blocks = block_events::fetch_block_headers(&base_url, checkpoint).await;
 
     // should produce an error for invalid checkpoint
     assert!(blocks.is_err());
@@ -278,12 +276,15 @@ async fn test_fetch_blocks_for_checkpoint() {
     log::debug!("[{:#?}]", gen_blocks);
 
     let checkpoint = (10, *gen_blocks.get(9).unwrap());
-    let blocks = block_events::fetch_block_headers(
-        format!("{}:{}", HOST_IP, mempool.get_host_port_ipv4(8999)).as_str(),
-        checkpoint,
-    )
-    .await
-    .unwrap();
+    let base_url = format!(
+        "http://{}:{}/api/v1",
+        HOST_IP,
+        mempool.get_host_port_ipv4(8999)
+    );
+
+    let blocks = block_events::fetch_block_headers(&base_url, checkpoint)
+        .await
+        .unwrap();
 
     pin_mut!(blocks);
     // should return all 10 blocks from 10 to 20, as 10 being the checkpoint
@@ -297,7 +298,7 @@ async fn test_fetch_blocks_for_checkpoint() {
 #[serial]
 async fn test_failure_for_invalid_websocket_url() {
     let block_events =
-        websocket::listen_new_block_headers(format!("{}:{}", HOST_IP, 8999).as_str()).await;
+        websocket::listen_new_block_headers(&format!("ws://{}:{}", HOST_IP, 8999)).await;
 
     // should return an Err.
     assert!(block_events.is_err());
@@ -313,22 +314,19 @@ async fn test_failure_for_invalid_websocket_url() {
 #[serial]
 async fn test_block_events_stream() {
     let _ = env_logger::try_init();
-    let delay = Duration::from_millis(5000);
+
+    let MempoolTestClient {
+        bitcoind,
+        mariadb_database,
+        mempool_backend,
+    } = MempoolTestClient::default();
 
     let docker = clients::Cli::docker();
-    let client = MempoolTestClient::default();
+    let _mariadb = docker.run(mariadb_database);
 
-    let _mariadb = docker.run(client.mariadb_database);
-
-    std::thread::sleep(delay); // there is some delay between running the docker and the port being really available
-    let mempool = docker.run(client.mempool_backend);
-
-    log::debug!(
-        "{:?}",
-        &client.bitcoind.client.get_blockchain_info().unwrap(),
-    );
-
-    log::debug!("{:?}", &client.bitcoind.client.get_chain_tips(),);
+    // there is some small delay between running the docker for mariadb database and the port being really available
+    std::thread::sleep(Duration::from_millis(5000));
+    let mempool = docker.run(mempool_backend);
 
     let http_base_url = format!(
         "http://{}:{}/api/v1",
@@ -337,41 +335,33 @@ async fn test_block_events_stream() {
     );
     let ws_base_url = format!("ws://{}:{}", HOST_IP, mempool.get_host_port_ipv4(8999));
 
-    // get block-events stream
-    let block_events = block_events::subscribe_to_block_headers(
-        http_base_url.as_str(),
-        ws_base_url.as_str(),
-        None,
-    )
-    .await
-    .unwrap();
-
-    // initiate bitcoind client
-    let rpc_client = &client.bitcoind.client;
+    // get stream of new block-events
+    let events = block_events::subscribe_to_block_headers(&http_base_url, &ws_base_url, None)
+        .await
+        .unwrap();
 
     // generate 5 new blocks through bitcoind rpc-client
-    let mut generated_blocks = VecDeque::from(
-        rpc_client
-            .generate_to_address(5, &rpc_client.get_new_address(None, None).unwrap())
-            .unwrap(),
-    );
+    let address = &bitcoind.client.get_new_address(None, None).unwrap();
+    let mut blocks = VecDeque::from(bitcoind.client.generate_to_address(5, address).unwrap());
 
     // consume new blocks from block-events stream
-    pin_mut!(block_events);
-    while !generated_blocks.is_empty() {
-        let block_hash = generated_blocks.pop_front().unwrap();
-        let block_event = block_events.next().await.unwrap().unwrap();
+    pin_mut!(events);
+    while !blocks.is_empty() {
+        let block_hash = blocks.pop_front().unwrap();
+        let event = events.next().await.unwrap().unwrap();
+
+        log::debug!("[event][{:#?}]", event);
 
         // should produce a BlockEvent::Connected result for each block event
-        assert!(matches!(block_event, BlockEvent::Connected { .. }));
+        assert!(matches!(event, BlockEvent::Connected { .. }));
 
-        // should parse the BlockEvent::Connected successfully
-        let connected_block = match block_event {
-            BlockEvent::Connected(block) => block,
+        // should handle and build the BlockEvent::Connected successfully
+        let connected = match event {
+            BlockEvent::Connected(header) => header,
             _ => unreachable!("This test is supposed to have only connected blocks, please check why it's generating disconnected and/or errors at the moment."),
         };
 
-        assert_eq!(block_hash.to_owned(), connected_block.block_hash());
+        assert_eq!(block_hash, connected.block_hash());
     }
 }
 
@@ -379,27 +369,31 @@ async fn test_block_events_stream() {
 #[serial]
 async fn test_block_events_stream_with_checkpoint() {
     let _ = env_logger::try_init();
-    let delay = Duration::from_millis(5000);
 
+    let MempoolTestClient {
+        bitcoind,
+        mariadb_database,
+        mempool_backend,
+    } = MempoolTestClient::default();
+
+    // generate 10 new blocks through bitcoind rpc-client
+    let address = &bitcoind.client.get_new_address(None, None).unwrap();
+    let blocks = bitcoind.client.generate_to_address(10, address).unwrap();
+
+    // expected blocks are from the 4th block in the chain (3rd in the new generated blocks)
+    let mut expected_block_hashes = VecDeque::from(blocks[3..].to_vec());
+
+    // checkpoint starts in 3rd new block (index 2)
+    let ckpt_block_hash = *blocks.get(2).unwrap();
+    let checkpoint = Some((3, ckpt_block_hash));
+
+    // start database (mariadb) and backend (mempool/backend)
     let docker = clients::Cli::docker();
-    let client = MempoolTestClient::default();
+    let _mariadb = docker.run(mariadb_database);
 
-    // initiate bitcoind client
-    let rpc_client = &client.bitcoind.client;
-
-    // generate first 5 new blocks through bitcoind rpc-client
-    let first_blocks = rpc_client
-        .generate_to_address(10, &rpc_client.get_new_address(None, None).unwrap())
-        .unwrap();
-
-    // checkpoint starts from 3rd block (index 2)
-    let mut first_blocks = VecDeque::from(first_blocks[2..].to_vec());
-    let checkpoint = rpc_client.get_block(first_blocks.front().unwrap()).unwrap();
-
-    let _mariadb = docker.run(client.mariadb_database);
-
-    std::thread::sleep(delay); // there is some delay between running the docker and the port being really available
-    let mempool = docker.run(client.mempool_backend);
+    // there is some small delay between running the docker for mariadb database and the port being really available
+    std::thread::sleep(Duration::from_millis(5000));
+    let mempool = docker.run(mempool_backend);
 
     let http_base_url = format!(
         "http://{}:{}/api/v1",
@@ -408,31 +402,28 @@ async fn test_block_events_stream_with_checkpoint() {
     );
     let ws_base_url = format!("ws://{}:{}", HOST_IP, mempool.get_host_port_ipv4(8999));
 
-    // get block-events stream, starting from the tip
-    let block_events = block_events::subscribe_to_block_headers(
-        http_base_url.as_str(),
-        ws_base_url.as_str(),
-        Some((3, checkpoint.block_hash())),
-    )
-    .await
-    .unwrap();
+    // get block-events stream, starting from the checkpoint
+    let block_events =
+        block_events::subscribe_to_block_headers(&http_base_url, &ws_base_url, checkpoint)
+            .await
+            .unwrap();
 
     // consume new blocks from block-events stream
     pin_mut!(block_events);
-    while !first_blocks.is_empty() {
-        let block_hash = first_blocks.pop_front().unwrap();
+    while !expected_block_hashes.is_empty() {
+        let expected_hash = expected_block_hashes.pop_front().unwrap();
         let block_event = block_events.next().await.unwrap().unwrap();
 
         // should produce a BlockEvent::Connected result for each block event
         assert!(matches!(block_event, BlockEvent::Connected { .. }));
 
         // should parse the BlockEvent::Connected successfully
-        let connected_block = match block_event {
-            BlockEvent::Connected(block) => block,
+        let connected_hash = match block_event {
+            BlockEvent::Connected(block) => block.block_hash(),
             _ => unreachable!("This test is supposed to have only connected blocks, please check why it's generating disconnected and/or errors at the moment."),
         };
 
-        assert_eq!(block_hash.to_owned(), connected_block.block_hash());
+        assert_eq!(expected_hash, connected_hash);
     }
 }
 
@@ -440,15 +431,20 @@ async fn test_block_events_stream_with_checkpoint() {
 #[serial]
 async fn test_block_events_stream_with_reorg() {
     let _ = env_logger::try_init();
-    let delay = Duration::from_millis(5000);
 
+    let MempoolTestClient {
+        bitcoind,
+        mariadb_database,
+        mempool_backend,
+    } = MempoolTestClient::default();
+
+    // start database (mariadb) and backend (mempool/backend)
     let docker = clients::Cli::docker();
-    let client = MempoolTestClient::default();
+    let _mariadb = docker.run(mariadb_database);
 
-    let _mariadb = docker.run(client.mariadb_database);
-
-    std::thread::sleep(delay); // there is some delay between running the docker and the port being really available
-    let mempool = docker.run(client.mempool_backend);
+    // there is some small delay between running the docker for mariadb database and the port being really available
+    std::thread::sleep(Duration::from_millis(5000));
+    let mempool = docker.run(mempool_backend);
 
     let http_base_url = format!(
         "http://{}:{}/api/v1",
@@ -458,20 +454,15 @@ async fn test_block_events_stream_with_reorg() {
     let ws_base_url = format!("ws://{}:{}", HOST_IP, mempool.get_host_port_ipv4(8999));
 
     // get block-events stream
-    let block_events =
-        block_events::subscribe_to_block_headers(http_base_url.deref(), ws_base_url.deref(), None)
-            .await
-            .unwrap();
-
-    // initiate bitcoind client
-    let rpc_client = &client.bitcoind.client;
+    let block_events = block_events::subscribe_to_block_headers(&http_base_url, &ws_base_url, None)
+        .await
+        .unwrap();
 
     // generate 5 new blocks through bitcoind rpc-client
-    let generated_blocks = VecDeque::from(
-        rpc_client
-            .generate_to_address(5, &rpc_client.get_new_address(None, None).unwrap())
-            .unwrap(),
-    );
+    let address = bitcoind.client.get_new_address(None, None).unwrap();
+    let generated_blocks =
+        VecDeque::from(bitcoind.client.generate_to_address(5, &address).unwrap());
+
     let mut new_blocks = generated_blocks.clone();
 
     // consume new blocks from block-events stream
@@ -494,16 +485,13 @@ async fn test_block_events_stream_with_reorg() {
     // invalidate last 2 blocks
     let mut invalidated_blocks = VecDeque::new();
     for block in generated_blocks.range(3..) {
-        rpc_client.invalidate_block(block).unwrap();
+        bitcoind.client.invalidate_block(block).unwrap();
         invalidated_blocks.push_front(block);
     }
 
     // generate 2 new blocks
-    let mut new_blocks = VecDeque::from(
-        rpc_client
-            .generate_to_address(3, &rpc_client.get_new_address(None, None).unwrap())
-            .unwrap(),
-    );
+    let address = bitcoind.client.get_new_address(None, None).unwrap();
+    let mut new_blocks = VecDeque::from(bitcoind.client.generate_to_address(3, &address).unwrap());
 
     // should disconnect invalidated blocks
     while !invalidated_blocks.is_empty() {

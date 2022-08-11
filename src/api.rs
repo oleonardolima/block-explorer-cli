@@ -32,9 +32,7 @@ impl From<BlockExtended> for BlockHeader {
     fn from(extended: BlockExtended) -> Self {
         BlockHeader {
             version: extended.version,
-            prev_blockhash: extended
-                .prev_blockhash
-                .expect("Given `api::BlockExtended` does not have prev_blockhash field"),
+            prev_blockhash: extended.prev_blockhash.unwrap_or_default(),
             merkle_root: extended.merkle_root,
             time: extended.time,
             bits: extended.bits,
